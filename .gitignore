@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+uploads/
+*.pdf
+!sample_data/*.pdf
+*.xlsx
+!sample_data/*.xlsx
+*.csv
+!sample_data/*.csv
