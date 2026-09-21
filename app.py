@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
 import streamlit as st
 
-from src.extraction.csv_extract import extract_csv
-from src.extraction.excel_extract import extract_excel
-from src.extraction.pdf_extract import extract_pdf
+from src.extraction.dispatch import extract_path
+from src.extraction.schema import normalise_transactions
 from src.reconciliation.matcher import ReconciliationSettings
 from src.reconciliation.detailed_reconciliation import reconcile_detailed
 from src.reconciliation.history import get_reviews, list_runs, load_run, save_review, save_run
 from src.reconciliation.report import make_detailed_excel_report
 from src.reconciliation.dashboard import reviewed_differences
 from src.reconciliation.dashboard_ui import render_dashboard
+from src.reconciliation.signs import SIGN_OPTIONS, align_signs
 
 
 st.set_page_config(
@@ -33,6 +34,8 @@ st.caption(
 
 if "reconciliation_report" not in st.session_state:
     st.session_state.reconciliation_report = None
+if "extracted_ledgers" not in st.session_state:
+    st.session_state.extracted_ledgers = None
 
 
 def clear_report() -> None:
@@ -40,20 +43,31 @@ def clear_report() -> None:
 
 
 def extract_upload(upload, folder: Path):
-    suffix = Path(upload.name).suffix.lower()
     path = folder / upload.name
     path.write_bytes(upload.getvalue())
+    return extract_path(path)
 
-    if suffix == ".csv":
-        return extract_csv(path)
 
-    if suffix in {".xlsx", ".xls"}:
-        return extract_excel(path)
+def upload_signature(upload) -> str:
+    """Identify the exact uploaded bytes so stale previews are never reused."""
+    digest = hashlib.sha256(upload.getvalue()).hexdigest()
+    return f"{upload.name}:{digest}"
 
-    if suffix == ".pdf":
-        return extract_pdf(path)
 
-    raise ValueError("Unsupported file format.")
+def approved_transactions(edited: pd.DataFrame, original: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Validate an edited extraction preview before it reaches matching."""
+    required = edited.reindex(columns=["date", "reference", "description", "amount"])
+    result = normalise_transactions(required, source_name)
+    result.attrs = dict(original.attrs)
+    if result.empty:
+        raise ValueError(f"{source_name} has no approved transaction rows.")
+    return result
+
+
+def extraction_label(position: str, frame: pd.DataFrame) -> str:
+    layout = str(frame.attrs.get("detected_format", "structured table")).replace("_", " ").title()
+    method = str(frame.attrs.get("extraction_method", "structured file"))
+    return f"{position}: {layout} via {method}"
 
 
 def render_history(key: str) -> None:
@@ -88,104 +102,170 @@ with st.sidebar:
 
 with st.expander("Upload ledgers / start a new reconciliation", expanded=st.session_state.reconciliation_report is None):
     first, second = st.columns(2)
+    supported_types = ["csv", "xlsx", "xls", "pdf", "png", "jpg", "jpeg"]
 
     with first:
-        first_upload = st.file_uploader(
-            "Source table 1",
-            type=["csv", "xlsx", "xls", "pdf"],
-            key="first",
-        )
-
+        first_upload = st.file_uploader("Source table 1", type=supported_types, key="first")
     with second:
-        second_upload = st.file_uploader(
-            "Source table 2",
-            type=["csv", "xlsx", "xls", "pdf"],
-            key="second",
+        second_upload = st.file_uploader("Source table 2", type=supported_types, key="second")
+
+    st.caption("Each side may use a different format. Images and scanned PDFs are OCR-checked before reconciliation.")
+    setting_columns = st.columns(3)
+    with setting_columns[0]:
+        amount_tolerance = st.number_input("Amount tolerance", min_value=0.0, value=1.0, step=0.5)
+    with setting_columns[1]:
+        date_tolerance = st.number_input("Date tolerance (days)", min_value=0, value=3, step=1)
+    with setting_columns[2]:
+        sign_mode = st.selectbox(
+            "Counterparty sign handling",
+            SIGN_OPTIONS,
+            help="Auto mode reverses the second ledger only when at least two matching absolute values provide stronger opposite-sign evidence.",
         )
 
-    with st.container():
-        st.caption("Matching settings")
-        amount_tolerance = st.number_input(
-            "Amount tolerance",
-            min_value=0.0,
-            value=1.0,
-            step=0.5,
-        )
+    current_signature = None
+    if first_upload and second_upload:
+        current_signature = (upload_signature(first_upload), upload_signature(second_upload))
 
-        date_tolerance = st.number_input(
-            "Date tolerance (days)",
-            min_value=0,
-            value=3,
-            step=1,
-        )
-
-    if st.button("Reconcile ledgers", type="primary", use_container_width=True):
+    if st.button("Extract ledgers for review", type="primary", use_container_width=True):
         if not first_upload or not second_upload:
             st.error("Please upload both ledgers.")
-
         else:
             try:
-                progress_bar = st.progress(0, text="Starting reconciliation")
-                with st.status("Reconciling ledgers", expanded=True) as status:
+                with st.status("Extracting ledger rows", expanded=True) as extraction_status:
                     with TemporaryDirectory() as directory:
-                        status.write("Extracting the first ledger")
-                        progress_bar.progress(15, text="Extracting the first ledger")
-                        left = extract_upload(first_upload, Path(directory))
-                        status.write("Extracting the second ledger")
-                        progress_bar.progress(30, text="Extracting the second ledger")
-                        right = extract_upload(second_upload, Path(directory))
+                        extraction_status.write("Reading the first ledger")
+                        extracted_left = extract_upload(first_upload, Path(directory))
+                        extraction_status.write("Reading the second ledger")
+                        extracted_right = extract_upload(second_upload, Path(directory))
+                    extraction_status.update(label="Extraction ready for review", state="complete", expanded=False)
+                st.session_state.extracted_ledgers = {
+                    "signature": current_signature,
+                    "left": extracted_left,
+                    "right": extracted_right,
+                    "first_name": first_upload.name,
+                    "second_name": second_upload.name,
+                }
+            except ValueError as exc:
+                st.session_state.extracted_ledgers = None
+                st.error("We could not extract one of the ledgers safely. No reconciliation was run.")
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+            except Exception as exc:
+                st.session_state.extracted_ledgers = None
+                st.error("Ledger extraction failed. Technical details:")
+                st.exception(exc)
 
-                        def update_progress(message: str) -> None:
-                            steps = {
-                                "Grouping the first ledger": 45,
-                                "Grouping the second ledger": 55,
-                                "Finding likely transaction counterparts": 70,
-                                "Selecting one-to-one matches": 82,
-                                "Preparing audit tables": 90,
-                            }
-                            status.write(message)
-                            progress_bar.progress(steps.get(message, 90), text=message)
+    pending = st.session_state.extracted_ledgers
+    if pending and current_signature == pending.get("signature"):
+        st.divider()
+        st.subheader("Review extracted transactions")
+        st.info(
+            f"{extraction_label('First', pending['left'])} | "
+            f"{extraction_label('Second', pending['right'])}"
+        )
 
-                        detailed = reconcile_detailed(
-                            left,
-                            right,
-                            ReconciliationSettings(
-                                amount_tolerance=amount_tolerance,
-                                date_tolerance_days=date_tolerance,
-                            ),
-                            progress=update_progress,
-                        )
-                        status.write("Creating the Excel report")
-                        progress_bar.progress(96, text="Creating the Excel report")
-                        excel_report = make_detailed_excel_report(detailed, first_upload.name, second_upload.name)
+        for source_name, frame in ((pending["first_name"], pending["left"]), (pending["second_name"], pending["right"])):
+            warnings = frame.attrs.get("extraction_warnings", [])
+            if frame.attrs.get("review_required") and not warnings:
+                st.warning(f"{source_name}: OCR was used. Compare the editable rows with the source before approval.")
+            for warning in warnings:
+                st.warning(f"{source_name}: {warning}")
+
+        preview_columns = ["date", "reference", "description", "amount"]
+        review_columns = st.columns(2)
+        editor_key = hashlib.sha256("|".join(current_signature).encode()).hexdigest()[:12]
+        with review_columns[0]:
+            st.markdown(f"**{pending['first_name']}** — {len(pending['left'])} rows")
+            edited_left = st.data_editor(
+                pending["left"][preview_columns],
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"left_review_{editor_key}",
+            )
+            evidence = pending["left"].attrs.get("review_rows")
+            if evidence:
+                with st.expander("Show first-ledger OCR/debit-credit evidence"):
+                    st.dataframe(pd.DataFrame(evidence), use_container_width=True, hide_index=True)
+        with review_columns[1]:
+            st.markdown(f"**{pending['second_name']}** — {len(pending['right'])} rows")
+            edited_right = st.data_editor(
+                pending["right"][preview_columns],
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"right_review_{editor_key}",
+            )
+            evidence = pending["right"].attrs.get("review_rows")
+            if evidence:
+                with st.expander("Show second-ledger OCR/debit-credit evidence"):
+                    st.dataframe(pd.DataFrame(evidence), use_container_width=True, hide_index=True)
+
+        if st.button("Approve tables and reconcile", type="primary", use_container_width=True):
+            try:
+                approved_left = approved_transactions(edited_left, pending["left"], pending["first_name"])
+                approved_right = approved_transactions(edited_right, pending["right"], pending["second_name"])
+                left, right, sign_note = align_signs(
+                    approved_left,
+                    approved_right,
+                    sign_mode,
+                    tolerance=amount_tolerance,
+                )
+
+                progress_bar = st.progress(0, text="Starting reconciliation")
+                with st.status("Reconciling approved rows", expanded=True) as status:
+                    def update_progress(message: str) -> None:
+                        steps = {
+                            "Grouping the first ledger": 20,
+                            "Grouping the second ledger": 35,
+                            "Finding likely transaction counterparts": 60,
+                            "Selecting one-to-one matches": 78,
+                            "Preparing audit tables": 90,
+                        }
+                        status.write(message)
+                        progress_bar.progress(steps.get(message, 90), text=message)
+
+                    detailed = reconcile_detailed(
+                        left,
+                        right,
+                        ReconciliationSettings(
+                            amount_tolerance=amount_tolerance,
+                            date_tolerance_days=date_tolerance,
+                        ),
+                        progress=update_progress,
+                    )
+                    status.write("Creating the Excel report")
+                    progress_bar.progress(96, text="Creating the Excel report")
+                    first_report_name = pending["first_name"] + (" [signs reversed]" if sign_note.startswith("First") else "")
+                    second_report_name = pending["second_name"] + (" [signs reversed]" if sign_note.startswith("Second") else "")
+                    excel_report = make_detailed_excel_report(detailed, first_report_name, second_report_name)
                     status.update(label="Reconciliation complete", state="complete", expanded=False)
                 progress_bar.progress(100, text="Reconciliation complete")
 
-                detected = []
-                for position, source in (("First", left), ("Second", right)):
-                    detected_format = source.attrs.get("detected_format")
-                    if detected_format:
-                        detected.append(f"{position} PDF: {detected_format.replace('_', ' ').title()}")
-
-                run_id = save_run(detailed, first_upload.name, second_upload.name, excel_report)
+                detected = [
+                    extraction_label("First", approved_left),
+                    extraction_label("Second", approved_right),
+                    sign_note,
+                ]
+                run_id = save_run(detailed, pending["first_name"], pending["second_name"], excel_report)
                 st.session_state.reconciliation_report = {
                     "run_id": run_id,
                     "detailed": detailed,
-                    "first_name": first_upload.name,
-                    "second_name": second_upload.name,
+                    "first_name": pending["first_name"],
+                    "second_name": pending["second_name"],
                     "left_rows": len(left),
                     "right_rows": len(right),
                     "detected": detected,
                     "excel_report": excel_report,
                 }
-
+                st.rerun()
             except ValueError as exc:
-                st.error("We could not read one of the source tables. Please check that it contains a date and an amount (or debit/credit) column.")
+                st.error("The reviewed rows could not be reconciled safely.")
                 with st.expander("Technical details"):
                     st.code(str(exc))
             except Exception as exc:
                 st.error("Reconciliation failed. Technical details:")
                 st.exception(exc)
+    elif pending and current_signature != pending.get("signature"):
+        st.info("The selected files changed. Extract them again before reconciliation.")
 
 
 saved_report = st.session_state.reconciliation_report

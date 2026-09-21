@@ -177,7 +177,11 @@ def _candidate(left: pd.Series, right: pd.Series, settings: ReconciliationSettin
     payment_pair = bool(left["is_payment"] and right["is_payment"])
     opening_match = left["group_key"] == right["group_key"] == "opening_balance"
     tax_match = str(left["group_key"]).startswith("tax:") and str(right["group_key"]).startswith("tax:")
-    plausible = opening_match or tax_match or vehicle_match or business_match or (amount_match and (day_gap <= 31 or payment_pair)) or (description_score >= 82 and day_gap <= 7)
+    date_within_tolerance = day_gap <= settings.date_tolerance_days
+    plausible = opening_match or (
+        date_within_tolerance
+        and (tax_match or vehicle_match or business_match or amount_match or description_score >= 82 or payment_pair)
+    )
     score = (60 if vehicle_match or business_match or opening_match or tax_match else 0) + (25 if amount_match else max(0, 20 - abs(amount_difference) / max(abs(float(left["amount"])), abs(float(right["amount"])), 1) * 20)) + max(0, 10 - day_gap) + description_score * 0.05
     return plausible, score, day_gap, amount_difference, description_score
 
@@ -239,7 +243,10 @@ def _candidate_group_pairs(left_groups: pd.DataFrame, right_groups: pd.DataFrame
             for candidate_bucket in range(bucket - 1, bucket + 2):
                 candidates.update(by_product_weight.get((product, candidate_bucket), ()))
         date = pd.to_datetime(left_row["date"]).normalize()
-        for candidate_date in pd.date_range(date - pd.Timedelta(days=7), date + pd.Timedelta(days=7)):
+        for candidate_date in pd.date_range(
+            date - pd.Timedelta(days=settings.date_tolerance_days),
+            date + pd.Timedelta(days=settings.date_tolerance_days),
+        ):
             candidates.update(by_date.get(candidate_date, ()))
         amount = float(left_row["amount"])
         start = bisect_left(amount_values, amount - settings.amount_tolerance)
@@ -300,10 +307,14 @@ def _action(category: str, difference: float) -> tuple[str, str, str]:
 
 
 def _source_table(work: pd.DataFrame, table_name: str) -> pd.DataFrame:
-    columns = ["source_row", "date", "reference", "description", "amount", "group_key", "recon_ref"]
+    columns = ["source_row", "date", "reference", "description"]
+    if "_recorded_amount" in work:
+        columns.append("_recorded_amount")
+    columns.extend(["amount", "group_key", "recon_ref"])
     result = work.reindex(columns=columns).rename(columns={
         "source_row": "#", "date": "Date", "reference": "Reference", "description": "Description",
-        "amount": "Amount", "group_key": "Transaction group", "recon_ref": "Recon ref",
+        "_recorded_amount": "Recorded amount", "amount": "Amount",
+        "group_key": "Transaction group", "recon_ref": "Recon ref",
     })
     return result
 

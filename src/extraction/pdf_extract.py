@@ -1,4 +1,4 @@
-"""Automatic extraction for supported image-only PDF ledger layouts."""
+"""Adaptive PDF ledger extraction with text-layer preference and OCR fallback."""
 
 from __future__ import annotations
 
@@ -6,67 +6,54 @@ import os
 from pathlib import Path
 
 import pandas as pd
+from pypdf import PdfReader
 
-from .ocr_extract import pdf_to_lines, parse_kd_feeds, parse_quickbooks
-from .schema import normalise_transactions, parse_amount
+from .document_extract import transactions_from_lines
+from .ocr_extract import detect_ledger_format, pdf_to_lines
+
+
+def _embedded_text_lines(path: str | Path) -> list[tuple[int, int, str, float]]:
+    """Read positioned-looking rows from a PDF text layer when one exists."""
+    lines: list[tuple[int, int, str, float]] = []
+    reader = PdfReader(str(path))
+    for page_number, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:
+            text = page.extract_text() or ""
+        for row_number, value in enumerate(text.splitlines()):
+            value = value.strip()
+            if value:
+                lines.append((page_number, row_number, value, 100.0))
+    return lines
 
 
 def detect_pdf_format(lines) -> str:
-    """Identify a supported ledger layout from its first-page heading."""
-    header_text = " ".join(
-        line.upper()
-        for _, _, line in lines[:40]
-    )
-
-    if "ACCOUNT QUICKREPORT" in header_text:
-        return "quickbooks"
-
-    if (
-        "BUSINESS PARTNER LEDGER" in header_text
-        or "GENERAL LEDGER" in header_text
-    ):
-        return "kd_feeds"
-
-    raise ValueError(
-        "This PDF ledger format is not recognized yet. "
-        "Please use a supported QuickBooks or KD Feeds ledger."
-    )
+    """Backward-compatible alias used by existing callers."""
+    return detect_ledger_format(lines)
 
 
 def extract_pdf(path: str | Path) -> pd.DataFrame:
-    """
-    Extract a supported PDF ledger and convert it to the common schema.
+    """Extract a PDF ledger, preferring exact embedded text over OCR."""
+    text_error: Exception | None = None
+    try:
+        text_lines = _embedded_text_lines(path)
+        if text_lines:
+            return transactions_from_lines(
+                text_lines,
+                path,
+                extraction_method="embedded PDF text",
+            )
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        text_error = exc
 
-    Format is detected automatically; the client never chooses it manually.
-    """
     poppler_path = os.getenv("POPPLER_PATH") or None
-    lines = pdf_to_lines(path, poppler_path=poppler_path)
-    ledger_format = detect_pdf_format(lines)
-
-    if ledger_format == "quickbooks":
-        raw = parse_quickbooks(lines)
-
-        mapped = pd.DataFrame({
-            "date": raw["date"],
-            "reference": "",
-            "description": raw["line"],
-            "amount": raw["amount"],
-        })
-
-    else:
-        raw = parse_kd_feeds(lines)
-
-        debit = raw["debit"].map(parse_amount).fillna(0)
-        credit = raw["credit"].map(parse_amount).fillna(0)
-
-        mapped = pd.DataFrame({
-            "date": raw["date"],
-            "reference": raw["voucher"],
-            "description": raw["narration"],
-            "amount": credit - debit,
-        })
-
-    result = normalise_transactions(mapped, path)
-    result.attrs["detected_format"] = ledger_format
-
+    ocr_lines = pdf_to_lines(path, poppler_path=poppler_path)
+    try:
+        result = transactions_from_lines(ocr_lines, path, extraction_method="PDF OCR")
+    except ValueError as exc:
+        if text_error is not None:
+            raise ValueError(f"PDF text extraction failed ({text_error}); OCR also failed ({exc}).") from exc
+        raise
+    result.attrs["used_ocr_fallback"] = True
     return result

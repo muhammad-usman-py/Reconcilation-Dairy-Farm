@@ -6,4 +6,5 @@ rapidfuzz>=3.9
 pytesseract>=0.3
 pdf2image>=1.17
 Pillow>=10.0
+pypdf>=5.0
 pytest>=8.0

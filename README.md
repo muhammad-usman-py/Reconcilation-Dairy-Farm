@@ -10,7 +10,8 @@ Built for a practical workflow: **upload → reconcile → understand → review
 
 ## Highlights
 
-- **Multiple input formats:** CSV, Excel (`.xlsx`, `.xls`, with the appropriate reader installed), and supported text/scanned PDFs.
+- **Independent input formats:** each side may be CSV, Excel (`.xlsx`, `.xls`), PDF, PNG, JPG or JPEG; mixed image/PDF comparisons are supported.
+- **Extraction review:** OCR-derived rows are shown in an editable table with Debit/Credit/Balance evidence before matching starts.
 - **Consistent transaction schema:** extraction paths converge on date, reference, description, amount and source filename.
 - **Business-level grouping:** related goods, brokery/commission and freight entries can be grouped before comparison.
 - **Candidate-based matching:** narrows likely counterparts before scoring, then makes deterministic one-to-one group assignments.
@@ -57,6 +58,7 @@ Python packages and system programs are separate dependencies:
 | Component | Purpose |
 | --- | --- |
 | `pdf2image` | Python interface for rendering PDF pages. |
+| `pypdf` | Uses an embedded PDF text layer when available, avoiding unnecessary OCR. |
 | Poppler | Provides `pdfinfo` and PDF-rendering executables. |
 | `pytesseract` | Python interface to the OCR engine. |
 | Tesseract OCR | Reads text from rendered page images. |
@@ -82,13 +84,14 @@ If Windows reports an Application Control block, stop and resolve the installati
 
 ## Using the app
 
-1. Upload the first and second source ledgers.
-2. Confirm that the files cover comparable periods and use an agreed sign convention.
-3. Set the amount tolerance and click **Reconcile ledgers**.
-4. Read the dashboard result and formula before interpreting individual differences.
-5. Inspect the largest items, their source references and supporting evidence.
-6. In **Manual Review**, choose a reference and save a decision, reviewer and notes.
-7. Download the original detailed Excel report, or reopen the run later from **Saved reconciliations**.
+1. Upload the first and second source ledgers in any supported combination.
+2. Set the amount/date tolerances and sign-handling mode, then click **Extract ledgers for review**.
+3. Compare OCR-derived rows and their Debit/Credit/Balance evidence with the source. Correct, add or remove rows when necessary.
+4. Click **Approve tables and reconcile** only after the extracted values are acceptable.
+5. Read the dashboard result and formula before interpreting individual differences.
+6. Inspect the largest items, their source references and supporting evidence.
+7. In **Manual Review**, choose a reference and save a decision, reviewer and notes.
+8. Download the detailed Excel report, or reopen the run later from **Saved reconciliations**.
 
 Selecting new uploads does not replace a displayed report until another reconciliation completes. The displayed filenames identify the run currently being viewed.
 
@@ -163,9 +166,11 @@ Internal schema:
 date | reference | description | amount | source_file
 ```
 
-### PDFs
+### PDFs and images
 
-The project includes layout-specific extraction for QuickBooks-style Account QuickReport and KD Feeds-style Business Partner Ledger documents, including OCR support for scanned pages. It is not a universal PDF-table reader: new layouts, damaged scans and merged OCR text may require parser changes.
+PDFs first use their embedded text layer when available, which is faster and usually more accurate. Scanned PDFs fall back to OCR. PNG/JPG/JPEG files use the same positioned OCR layer directly. QuickBooks and KD Feeds layouts retain specialized parsers; other date-first tables are accepted conservatively when three trailing Debit/Credit/Balance values are visible. Unknown layouts, handwriting, damaged scans and merged columns may still require correction in the extraction-review table.
+
+OCR never silently establishes that a financial value is correct. The app shows extracted rows and available Debit/Credit/Balance evidence before reconciliation, and rejected or low-confidence rows produce visible warnings.
 
 ### Matching workflow
 
@@ -181,7 +186,9 @@ One-to-one assignment prevents reuse of a selected **group**. It does not guaran
 
 Grouping is currently asymmetric and tailored to the original ledger layouts. The two upload positions are not guaranteed to be interchangeable. Confirm source ordering when onboarding another ledger format.
 
-**Settings limitation:** the detailed engine uses internal date windows. The date-tolerance field is not currently applied uniformly to that engine, even though the row-level matcher supports it. Do not treat that field as a strict date cutoff for every detailed match.
+The detailed matcher applies the configured date tolerance to ordinary candidate pairs. Opening-balance groups remain a deliberate exception because their source dates frequently represent different carry-forward conventions.
+
+Counterparty ledgers may encode the same entry with opposite debit/credit signs. Auto sign handling reverses the second ledger only when at least two overlapping absolute values provide stronger opposite-sign evidence; the source schedule then retains a **Recorded amount** column beside the comparison amount. Manual keep/reverse options are also available.
 
 ## Excel report
 
@@ -262,7 +269,7 @@ Keep synthetic examples in a separate reviewed directory if needed. Ignore rules
 
 ### 2. Check Python and operating-system dependencies
 
-Keep the project's complete `requirements.txt`; make sure it includes `streamlit`, `pandas`, `openpyxl`, `pdf2image`, `pytesseract`, `Pillow`, `rapidfuzz` and any additional dependencies imported by the existing extractors. Legacy `.xls` reading also needs its compatible reader. Test dependency versions in a clean environment rather than assuming packages installed on your laptop exist in the cloud.
+Keep the project's complete `requirements.txt`; make sure it includes `streamlit`, `pandas`, `openpyxl`, `pypdf`, `pdf2image`, `pytesseract`, `Pillow`, `rapidfuzz` and any additional dependencies imported by the existing extractors. Legacy `.xls` reading also needs its compatible reader. Test dependency versions in a clean environment rather than assuming packages installed on your laptop exist in the cloud.
 
 Create or update **`packages.txt` at repository root** with:
 
@@ -297,7 +304,12 @@ For real client use, first add authentication, authorization on every read/write
 | Path | Responsibility |
 | --- | --- |
 | `app.py` | Uploads, progress, dashboard integration, review and history navigation. |
-| `src/extraction/` | File readers, structured-column discovery, PDF/OCR parsing and normalization. |
+| `src/extraction/dispatch.py` | Routes each upload independently by its own extension. |
+| `src/extraction/image_extract.py` | Direct PNG/JPG/JPEG OCR entry point. |
+| `src/extraction/document_extract.py` | Shared layout detection, mapping, warnings and review metadata. |
+| `src/extraction/pdf_extract.py` | Embedded-text PDF extraction with OCR fallback. |
+| `src/extraction/ocr_extract.py` | Positioned OCR plus specialized and generic ledger parsers. |
+| `src/extraction/schema.py` | Canonical transaction validation and normalization. |
 | `src/reconciliation/matcher.py` | Row-level matching and shared settings/helpers. |
 | `src/reconciliation/detailed_reconciliation.py` | Business grouping, candidate selection and detailed result tables. |
 | `src/reconciliation/dashboard.py` | KPI calculations, review-state aggregation and health rules. |
@@ -306,6 +318,7 @@ For real client use, first add authentication, authorization on every read/write
 | `src/reconciliation/history.py` | SQLite run storage and current review decisions. |
 | `tests/test_reconciliation.py` | Core matching and extraction regression tests. |
 | `tests/test_dashboard.py` | Dashboard calculations and Streamlit interaction tests. |
+| `tests/test_document_extraction.py` | Synthetic image/PDF routing, generic table parsing, sign alignment and date-tolerance tests. |
 
 ## Tests
 
@@ -313,10 +326,10 @@ From the project root, using the same environment as the app:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pytest
-.\.venv\Scripts\python.exe -m pytest tests/test_reconciliation.py tests/test_dashboard.py -q
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The dashboard update passed 17 automated tests, covering signed/gross differences, exact versus tolerance matches, group-count denominators, empty inputs, proof inconsistencies, review states, filters, history loading and immediate KPI refresh.
+The current project passed 23 automated tests on Python 3.12 and Streamlit 1.64.0. Coverage includes signed/gross differences, exact versus tolerance matches, independent image/PDF routing, generic Debit/Credit/Balance parsing, sign alignment, configured date tolerance, proof inconsistencies, review states, filters, history loading and immediate KPI refresh.
 
 The main-app UI test isolates file-extractor imports; it is not an end-to-end OCR test. Test representative PDFs and scan quality separately. No claim of universal ledger accuracy or accounting certification is made.
 
@@ -343,7 +356,7 @@ Before wider production use, priorities include:
 - PostgreSQL-backed durable history with migration and restore tests.
 - Safe, versioned report serialization: current history uses Python pickle and must only load trusted, app-owned data. Never import an untrusted history database.
 - Manual pairing corrections and an append-only review audit trail.
-- Consistent date-tolerance behaviour across matching engines.
+- More table-layout adapters and confidence checks for unfamiliar or handwritten ledgers.
 - Source-period selection, opening-balance validation and explicit sign-orientation controls.
 - Better extraction diagnostics, rejected-row reporting and broader PDF fixtures.
 - Review-aware Excel exports, retention controls and upload/OCR resource limits.
